@@ -105,6 +105,12 @@ class _EyeDetectionScreenState extends State<EyeDetectionScreen> {
   bool _isCameraInitialized = false;
   EyeMovement _currentEyeMovement = EyeMovement.neutral;
   int _currentAngle = 0;
+  bool _mounted = true;
+
+  // For frame skipping to improve performance
+  int _frameSkip = 0;
+  int _frameSkipCount = 3; // Process every 3rd frame
+  Timer? _captureTimer;
 
   // For debug information
   bool _showDebugInfo = true;
@@ -133,13 +139,17 @@ class _EyeDetectionScreenState extends State<EyeDetectionScreen> {
     _bluetoothService.messages.listen((message) {
       debugPrint("Bluetooth: $message");
       if (message.contains("Connected")) {
-        setState(() {
-          _bluetoothStatus = "Connected";
-        });
+        if (_mounted) {
+          setState(() {
+            _bluetoothStatus = "Connected";
+          });
+        }
       } else if (message.contains("Disconnected")) {
-        setState(() {
-          _bluetoothStatus = "Not Connected";
-        });
+        if (_mounted) {
+          setState(() {
+            _bluetoothStatus = "Not Connected";
+          });
+        }
       }
     });
   }
@@ -158,7 +168,8 @@ class _EyeDetectionScreenState extends State<EyeDetectionScreen> {
       enableContours: true,
       enableClassification: true,
       enableTracking: true,
-      performanceMode: FaceDetectorMode.accurate,
+      performanceMode:
+          FaceDetectorMode.fast, // Changed to fast for better performance
     );
     _faceDetector = FaceDetector(options: options);
   }
@@ -166,98 +177,110 @@ class _EyeDetectionScreenState extends State<EyeDetectionScreen> {
   Future<void> _initializeCamera() async {
     _cameraController = CameraController(
       widget.camera,
-      ResolutionPreset.medium,
+      ResolutionPreset.low, // Lower resolution for better performance
       enableAudio: false,
     );
 
     try {
       await _cameraController.initialize();
 
+      if (!_mounted) return;
+
       setState(() {
         _isCameraInitialized = true;
+        _debugText = "Camera initialized. Starting face detection...";
       });
 
-      _cameraController.startImageStream(_processCameraImage);
+      // Start a timer to regularly take pictures instead of using the image stream
+      _captureTimer =
+          Timer.periodic(const Duration(milliseconds: 300), (timer) {
+        if (!_mounted) {
+          timer.cancel();
+          return;
+        }
+
+        // Skip frames to reduce CPU load
+        if (_frameSkip < _frameSkipCount) {
+          _frameSkip++;
+          return;
+        }
+        _frameSkip = 0;
+
+        if (!_isDetecting &&
+            _cameraController.value.isInitialized &&
+            !_cameraController.value.isTakingPicture) {
+          _captureAndProcessImage();
+        }
+      });
     } catch (e) {
+      if (_mounted) {
+        setState(() {
+          _debugText = "Error initializing camera: $e";
+        });
+      }
       debugPrint('Error initializing camera: $e');
     }
   }
 
-  Future<void> _processCameraImage(CameraImage image) async {
+  Future<void> _captureAndProcessImage() async {
     if (_isDetecting) return;
-
     _isDetecting = true;
 
     try {
-      // Convert CameraImage to InputImage
-      final inputImage = _convertCameraImageToInputImage(image);
-      if (inputImage != null) {
-        final faces = await _faceDetector.processImage(inputImage);
-        _detectEyeMovements(faces);
+      // Take a picture
+      final XFile file = await _cameraController.takePicture();
 
-        // Update detected faces for visualization
-        setState(() {
-          _detectedFaces = faces;
-          _debugText = "Faces detected: ${faces.length}";
-          if (faces.isNotEmpty) {
-            Face face = faces.first;
-            _debugText +=
-                "\nLeft eye open: ${face.leftEyeOpenProbability?.toStringAsFixed(2) ?? 'unknown'}";
-            _debugText +=
-                "\nRight eye open: ${face.rightEyeOpenProbability?.toStringAsFixed(2) ?? 'unknown'}";
-            _debugText +=
-                "\nHead angle X: ${face.headEulerAngleX?.toStringAsFixed(2) ?? 'unknown'}";
-          }
-        });
+      if (!_mounted) return;
+
+      // Process the image
+      final inputImage = InputImage.fromFilePath(file.path);
+      final faces = await _faceDetector.processImage(inputImage);
+
+      if (!_mounted) return;
+
+      // Process the detected faces
+      _detectEyeMovements(faces);
+
+      // Update UI
+      setState(() {
+        _detectedFaces = faces;
+        _debugText = "Faces detected: ${faces.length}";
+        if (faces.isNotEmpty) {
+          Face face = faces.first;
+          _debugText +=
+              "\nLeft eye open: ${face.leftEyeOpenProbability?.toStringAsFixed(2) ?? 'unknown'}";
+          _debugText +=
+              "\nRight eye open: ${face.rightEyeOpenProbability?.toStringAsFixed(2) ?? 'unknown'}";
+          _debugText +=
+              "\nHead angle X: ${face.headEulerAngleX?.toStringAsFixed(2) ?? 'unknown'}";
+        }
+      });
+
+      // Clean up the temporary file
+      try {
+        File(file.path).deleteSync();
+      } catch (e) {
+        debugPrint("Error deleting temporary file: $e");
       }
     } catch (e) {
-      setState(() {
-        _debugText = "Error: $e";
-      });
-      debugPrint('Error processing camera image: $e');
+      if (_mounted) {
+        setState(() {
+          _debugText = "Error: $e";
+        });
+      }
+      debugPrint('Error processing image: $e');
     } finally {
       _isDetecting = false;
     }
   }
 
-  InputImage? _convertCameraImageToInputImage(CameraImage image) {
-    // For Android, we can use InputImage.fromMediaImage
-    if (Platform.isAndroid) {
-      final rotation = InputImageRotationValue.fromRawValue(
-              widget.camera.sensorOrientation) ??
-          InputImageRotation.rotation0deg;
-
-      return InputImage.fromBytes(
-        bytes: _concatenatePlanes(image.planes),
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: InputImageFormat.nv21,
-          bytesPerRow: image.planes[0].bytesPerRow,
-        ),
-      );
-    }
-    // For iOS, a different approach is needed, but we'll just use a simpler method
-    else {
-      return InputImage.fromFilePath(
-        widget.camera.name, // Just a placeholder, won't actually work
-      );
-    }
-  }
-
-  Uint8List _concatenatePlanes(List<Plane> planes) {
-    final allBytes = WriteBuffer();
-    for (final plane in planes) {
-      allBytes.putUint8List(plane.bytes);
-    }
-    return allBytes.done().buffer.asUint8List();
-  }
-
   void _detectEyeMovements(List<Face> faces) {
     if (faces.isEmpty) {
-      setState(() {
-        _currentEyeMovement = EyeMovement.neutral;
-      });
+      if (_mounted) {
+        setState(() {
+          _currentEyeMovement = EyeMovement.neutral;
+        });
+      }
       return;
     }
 
@@ -279,9 +302,11 @@ class _EyeDetectionScreenState extends State<EyeDetectionScreen> {
         // Less than 500ms between blinks, counting as double blink
         _blinkCount++;
         if (_blinkCount >= 2) {
-          setState(() {
-            _currentEyeMovement = EyeMovement.doubleBlinking;
-          });
+          if (_mounted) {
+            setState(() {
+              _currentEyeMovement = EyeMovement.doubleBlinking;
+            });
+          }
           // When double blink is detected, send the select command to ESP32
           if (_bluetoothService.isConnected) {
             _bluetoothService.sendSelectCommand();
@@ -326,19 +351,23 @@ class _EyeDetectionScreenState extends State<EyeDetectionScreen> {
       newEyeMovement = EyeMovement.neutral;
     }
 
-    setState(() {
-      _currentEyeMovement = newEyeMovement;
-    });
+    if (_mounted) {
+      setState(() {
+        _currentEyeMovement = newEyeMovement;
+      });
+    }
 
     _wasBlinking = isBlinking;
   }
 
   void _updateAngle(int change) {
-    setState(() {
-      _currentAngle += change;
-      // Ensure angle stays within reasonable limits (e.g., -180 to 180 degrees)
-      _currentAngle = math.max(-180, math.min(180, _currentAngle));
-    });
+    if (_mounted) {
+      setState(() {
+        _currentAngle += change;
+        // Ensure angle stays within reasonable limits (e.g., -180 to 180 degrees)
+        _currentAngle = math.max(-180, math.min(180, _currentAngle));
+      });
+    }
 
     // Send the angle to the ESP32 via Bluetooth
     if (_bluetoothService.isConnected) {
@@ -348,51 +377,64 @@ class _EyeDetectionScreenState extends State<EyeDetectionScreen> {
 
   // Start scanning for ESP32 devices
   Future<void> _startScan() async {
-    setState(() {
-      _isScanning = true;
-      _bluetoothStatus = "Scanning...";
-    });
+    if (_mounted) {
+      setState(() {
+        _isScanning = true;
+        _bluetoothStatus = "Scanning...";
+      });
+    }
 
     try {
       final devices = await _bluetoothService.startScan();
-      setState(() {
-        _devices = devices;
-        _isScanning = false;
-        _bluetoothStatus = devices.isEmpty
-            ? "No devices found"
-            : "Found ${devices.length} device(s)";
-      });
+      if (_mounted) {
+        setState(() {
+          _devices = devices;
+          _isScanning = false;
+          _bluetoothStatus = devices.isEmpty
+              ? "No devices found"
+              : "Found ${devices.length} device(s)";
+        });
+      }
     } catch (e) {
-      setState(() {
-        _isScanning = false;
-        _bluetoothStatus = "Scan error: $e";
-      });
+      if (_mounted) {
+        setState(() {
+          _isScanning = false;
+          _bluetoothStatus = "Scan error: $e";
+        });
+      }
       debugPrint("Bluetooth scan error: $e");
     }
   }
 
   // Connect to an ESP32 device
   Future<void> _connectToDevice(fbp.BluetoothDevice device) async {
-    setState(() {
-      _bluetoothStatus = "Connecting...";
-    });
+    if (_mounted) {
+      setState(() {
+        _bluetoothStatus = "Connecting...";
+      });
+    }
 
     try {
       final connected = await _bluetoothService.connectToDevice(device);
-      setState(() {
-        _bluetoothStatus = connected ? "Connected" : "Failed to connect";
-      });
+      if (_mounted) {
+        setState(() {
+          _bluetoothStatus = connected ? "Connected" : "Failed to connect";
+        });
+      }
     } catch (e) {
-      setState(() {
-        _bluetoothStatus = "Connection error";
-      });
+      if (_mounted) {
+        setState(() {
+          _bluetoothStatus = "Connection error";
+        });
+      }
       debugPrint("Bluetooth connection error: $e");
     }
   }
 
   @override
   void dispose() {
-    _cameraController.stopImageStream();
+    _mounted = false;
+    _captureTimer?.cancel();
     _cameraController.dispose();
     _faceDetector.close();
     _bluetoothService.dispose();
@@ -766,12 +808,12 @@ class FaceOverlayPainter extends CustomPainter {
         final leftEyeOpen = face.leftEyeOpenProbability! > 0.5;
         final leftEyeColor = leftEyeOpen ? Colors.green : Colors.red;
 
-        // Approximate left eye position (since we don't have exact coordinates)
+        // More accurate eye position calculations
         final leftEyeRect = Rect.fromLTWH(
-          faceRect.left + faceRect.width * 0.3,
-          faceRect.top + faceRect.height * 0.33,
-          faceRect.width * 0.15,
-          faceRect.height * 0.10,
+          faceRect.left + (faceRect.width * 0.25),
+          faceRect.top + (faceRect.height * 0.28),
+          faceRect.width * 0.2,
+          faceRect.height * 0.12,
         );
 
         canvas.drawOval(leftEyeRect, eyePaint..color = leftEyeColor);
@@ -781,12 +823,12 @@ class FaceOverlayPainter extends CustomPainter {
         final rightEyeOpen = face.rightEyeOpenProbability! > 0.5;
         final rightEyeColor = rightEyeOpen ? Colors.green : Colors.red;
 
-        // Approximate right eye position
+        // More accurate eye position calculations
         final rightEyeRect = Rect.fromLTWH(
-          faceRect.left + faceRect.width * 0.55,
-          faceRect.top + faceRect.height * 0.33,
-          faceRect.width * 0.15,
-          faceRect.height * 0.10,
+          faceRect.left + (faceRect.width * 0.55),
+          faceRect.top + (faceRect.height * 0.28),
+          faceRect.width * 0.2,
+          faceRect.height * 0.12,
         );
 
         canvas.drawOval(rightEyeRect, eyePaint..color = rightEyeColor);
@@ -836,7 +878,6 @@ class FaceOverlayPainter extends CustomPainter {
     }
   }
 
-  // Helper method to scale the face rectangle to the widget size
   Rect _scaleRect({
     required Rect rect,
     required Size imageSize,
@@ -844,45 +885,96 @@ class FaceOverlayPainter extends CustomPainter {
     required InputImageRotation rotation,
     required CameraLensDirection cameraLensDirection,
   }) {
-    // Handle different rotations
-    final bool isScreenPortrait = widgetSize.height > widgetSize.width;
-    final bool isCameraRotated = rotation == InputImageRotation.rotation90deg ||
-        rotation == InputImageRotation.rotation270deg;
+    // Get actual preview scale to maintain aspect ratio
+    final double scaleX, scaleY;
+    final double imageAspect = imageSize.width / imageSize.height;
+    final double widgetAspect = widgetSize.width / widgetSize.height;
 
-    // Adjust for front camera mirroring
-    final bool flipX = cameraLensDirection == CameraLensDirection.front;
-
-    // Scale factors
-    double scaleX = 1.0, scaleY = 1.0;
-    double offsetX = 0.0, offsetY = 0.0;
-
-    if (!isCameraRotated) {
-      scaleX = widgetSize.width / imageSize.width;
-      scaleY = widgetSize.height / imageSize.height;
+    if (rotation == InputImageRotation.rotation90deg ||
+        rotation == InputImageRotation.rotation270deg) {
+      // Swap dimensions for rotated image
+      if (widgetAspect > 1 / imageAspect) {
+        // Width constrained
+        scaleY = widgetSize.height;
+        scaleX = widgetSize.height * imageAspect;
+      } else {
+        // Height constrained
+        scaleX = widgetSize.width;
+        scaleY = widgetSize.width / imageAspect;
+      }
     } else {
-      scaleX = widgetSize.width / imageSize.height;
-      scaleY = widgetSize.height / imageSize.width;
+      if (widgetAspect > imageAspect) {
+        // Width constrained
+        scaleY = widgetSize.height;
+        scaleX = widgetSize.height * imageAspect;
+      } else {
+        // Height constrained
+        scaleX = widgetSize.width;
+        scaleY = widgetSize.width / imageAspect;
+      }
     }
 
-    // Create scaled rectangle
-    double scaledLeft, scaledTop, scaledWidth, scaledHeight;
+    // Calculate offset to center the preview
+    final double offsetX = (widgetSize.width - scaleX) / 2;
+    final double offsetY = (widgetSize.height - scaleY) / 2;
 
-    if (flipX) {
-      scaledLeft = imageSize.width - rect.right;
-    } else {
-      scaledLeft = rect.left;
+    // Convert to view coordinates
+    double x = rect.left;
+    double y = rect.top;
+    double width = rect.width;
+    double height = rect.height;
+
+    // Apply rotation transform
+    switch (rotation) {
+      case InputImageRotation.rotation90deg:
+        final double temp = x;
+        x = y;
+        y = imageSize.width - temp - width;
+        final double tempW = width;
+        width = height;
+        height = tempW;
+        break;
+      case InputImageRotation.rotation180deg:
+        x = imageSize.width - x - width;
+        y = imageSize.height - y - height;
+        break;
+      case InputImageRotation.rotation270deg:
+        final double temp = x;
+        x = imageSize.height - y - height;
+        y = temp;
+        final double tempW = width;
+        width = height;
+        height = tempW;
+        break;
+      case InputImageRotation.rotation0deg:
+        // No change needed
+        break;
     }
 
-    scaledLeft = scaledLeft * scaleX + offsetX;
-    scaledTop = rect.top * scaleY + offsetY;
-    scaledWidth = rect.width * scaleX;
-    scaledHeight = rect.height * scaleY;
+    // Handle front camera mirroring
+    if (cameraLensDirection == CameraLensDirection.front) {
+      if (rotation == InputImageRotation.rotation0deg ||
+          rotation == InputImageRotation.rotation180deg) {
+        x = imageSize.width - x - width;
+      } else {
+        y = imageSize.height - y - height;
+      }
+    }
 
-    return Rect.fromLTWH(scaledLeft, scaledTop, scaledWidth, scaledHeight);
+    // Scale to screen coordinates
+    final double scaleFactorX = scaleX / imageSize.width;
+    final double scaleFactorY = scaleY / imageSize.height;
+
+    return Rect.fromLTWH(
+      x * scaleFactorX + offsetX,
+      y * scaleFactorY + offsetY,
+      width * scaleFactorX,
+      height * scaleFactorY,
+    );
   }
 
   @override
-  bool shouldRepaint(FaceOverlayPainter oldDelegate) {
-    return oldDelegate.faces != faces;
+  bool shouldRepaint(covariant CustomPainter oldDelegate) {
+    return true;
   }
 }
